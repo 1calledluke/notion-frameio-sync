@@ -48,12 +48,20 @@ final class Coordinator: @unchecked Sendable {
         poller   = ProjectPoller(coordinator: self)
     }
 
+    private var commentsPoller: CommentsPoller?
+
     func start() {
         guard config.isConfigured else {
             Log("Coordinator: not configured — watching deferred")
             return
         }
         applyConfig()
+
+        // Review-loop return path: new Frame.io comments become Notion tasks.
+        commentsPoller?.stop()
+        let poller = CommentsPoller(ledger: ledger, frameio: frameio)
+        commentsPoller = poller
+        poller.start()
     }
 
     func applyConfig(newConfig: Config? = nil) {

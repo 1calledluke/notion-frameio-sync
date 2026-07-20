@@ -22,6 +22,10 @@ struct Config: Codable {
     var notionProjectsDB: String = "232714d3-333f-800b-8b27-000b178352f3"
     /// How often (seconds) to poll Notion for newly-activated projects
     var pollIntervalSeconds: Double = 90
+    /// Notion Tasks database ID (Frame.io comments become tasks here)
+    var notionTasksDB: String = "232714d3-333f-8042-8de7-d13c03d2ea6e"
+    /// How often (seconds) to poll Frame.io for new client comments; 0 disables
+    var commentsPollSeconds: Double = 300
 
     // MARK: - Persistence
 

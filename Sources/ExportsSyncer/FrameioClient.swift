@@ -287,6 +287,48 @@ final class FrameioClient: @unchecked Sendable {
         return FrameioShare(id: id, url: url)
     }
 
+    // MARK: - Comments
+
+    struct FrameioComment {
+        let id: String
+        let text: String
+        let authorName: String
+        let authorID: String?
+        let timestampSeconds: Double?   // position in the clip, if any
+        let insertedAt: String
+        let isReply: Bool
+    }
+
+    /// V4: GET /accounts/{a}/files/{f}/comments
+    func listComments(token: String, fileID: String) async throws -> [FrameioComment] {
+        let data = try await get(token: token,
+                                 path: "/accounts/\(accountID)/files/\(fileID)/comments")
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["data"] as? [[String: Any]] else { return [] }
+        return items.compactMap { d in
+            guard let id = d["id"] as? String else { return nil }
+            let owner = d["owner"] as? [String: Any]
+            return FrameioComment(
+                id: id,
+                text: (d["text"] as? String) ?? "",
+                authorName: (owner?["name"] as? String)
+                    ?? (owner?["display_name"] as? String) ?? "Client",
+                authorID: owner?["id"] as? String,
+                timestampSeconds: d["timestamp"] as? Double,
+                insertedAt: (d["inserted_at"] as? String) ?? "",
+                isReply: (d["parent_id"] as? String) != nil
+            )
+        }
+    }
+
+    /// The signed-in user's ID, so our own replies never become tasks.
+    func fetchOwnUserID(token: String) async throws -> String? {
+        let data = try await get(token: token, path: "/me")
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let user = (json?["data"] as? [String: Any]) ?? json
+        return user?["id"] as? String
+    }
+
     // MARK: - Helpers
 
     private func parseFolders(_ data: Data) -> [FrameioFolder] {

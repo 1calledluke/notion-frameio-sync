@@ -69,6 +69,13 @@ final class Ledger: @unchecked Sendable {
                 last_status       TEXT NOT NULL,
                 updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
             );
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS seen_comments (
+                comment_id  TEXT PRIMARY KEY,
+                task_created INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             """
         ]
         for sql in stmts {
@@ -187,6 +194,68 @@ final class Ledger: @unchecked Sendable {
             bindOptional(stmt, 4, record.frameioStackID)
             bindOptional(stmt, 5, record.frameioProjectFolderID)
             sqlite3_step(stmt)
+        }
+    }
+
+    // MARK: - Comment tracking (Frame.io comments -> Notion tasks)
+
+    /// Every uploaded file we could poll comments on, with the path so the
+    /// task title can carry a human filename.
+    func allUploadedFiles() -> [(relPath: String, fileID: String)] {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT rel_path, frameio_file_id FROM deliverables WHERE frameio_file_id IS NOT NULL"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+            var out: [(String, String)] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let rel = colText(stmt, 0), let fid = colText(stmt, 1) {
+                    out.append((rel, fid))
+                }
+            }
+            return out
+        }
+    }
+
+    func hasSeenComment(_ commentID: String) -> Bool {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT 1 FROM seen_comments WHERE comment_id = ?"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
+            sqlite3_bind_text(stmt, 1, commentID, -1, SQLITE_TRANSIENT)
+            return sqlite3_step(stmt) == SQLITE_ROW
+        }
+    }
+
+    func markCommentSeen(_ commentID: String, taskCreated: Bool) {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "INSERT OR REPLACE INTO seen_comments (comment_id, task_created) VALUES (?, ?)"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, commentID, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(stmt, 2, taskCreated ? 1 : 0)
+            sqlite3_step(stmt)
+        }
+    }
+
+    /// Notion project for an exports-relative file path, via the provisioned
+    /// project whose exports folder prefixes it (longest match wins).
+    func projectID(forExportsRelPath relPath: String) -> String? {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT notion_project_id, exports_rel_path FROM provisioned_projects"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+            var best: (id: String, len: Int)? = nil
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let pid = colText(stmt, 0), let prefix = colText(stmt, 1) else { continue }
+                if relPath.hasPrefix(prefix), prefix.count > (best?.len ?? -1) {
+                    best = (pid, prefix.count)
+                }
+            }
+            return best?.id
         }
     }
 

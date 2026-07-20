@@ -135,6 +135,41 @@ enum NotionAPI {
         return id
     }
 
+    /// Creates a task in the Tasks database for a Frame.io client comment.
+    /// Body of the page carries the full comment; title stays scannable.
+    static func createCommentTask(token: String, tasksDB: String,
+                                  title: String, projectID: String?,
+                                  url: String?, commentBody: String) -> String? {
+        var properties: [String: Any] = [
+            "Task Name": ["title": [["text": ["content": title]]]],
+            "Status": ["status": ["name": "Not started"]]
+        ]
+        if let pid = projectID {
+            properties["Project"] = ["relation": [["id": pid]]]
+        }
+        if let link = url {
+            properties["URL"] = ["url": link]
+        }
+        let body: [String: Any] = [
+            "parent": ["database_id": tasksDB],
+            "properties": properties,
+            "children": [[
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": ["rich_text": [["text": ["content": String(commentBody.prefix(1900))]]]]
+            ]]
+        ]
+        let reqURL = URL(string: "https://api.notion.com/v1/pages")!
+        var req = URLRequest(url: reqURL)
+        req.httpMethod = "POST"
+        setHeaders(&req, token: token)
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        guard let data = send(req),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = json["id"] as? String else { return nil }
+        return id
+    }
+
     // MARK: - Private helpers
 
     private static func queryDatabase(token: String, databaseID: String,
