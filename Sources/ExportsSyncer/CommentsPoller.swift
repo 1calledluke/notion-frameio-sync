@@ -60,6 +60,13 @@ final class CommentsPoller {
             let comments: [FrameioClient.FrameioComment]
             do {
                 comments = try await frameio.listComments(token: token, fileID: fileID)
+            } catch FrameioError.rateLimited {
+                // Every remaining file would hit the same wall. Stop, say so,
+                // and let the next pass pick up where this one left off — the
+                // ledger means nothing is lost by stopping early.
+                Notifier.report(reason: "frameio-rate-limit",
+                                "Frame.io rate limit reached — client comments aren't syncing to Notion. It'll retry automatically; tell me if it keeps happening.")
+                return
             } catch {
                 // 404s happen when a file was deleted on Frame.io — not fatal.
                 continue

@@ -340,15 +340,71 @@ final class FrameioClient: @unchecked Sendable {
         }
     }
 
-    private let clientID = Config.load().frameioClientID
+    /// Read at point of use, not cached at init — the same trap `AuthManager`
+    /// fell into. A blank ID here silently sends an empty `x-api-key` header for
+    /// the life of the process.
+    private var clientID: String { Config.load().frameioClientID }
+
+    /// Frame.io rate-limits per account, and the comments pass fans out one
+    /// request per uploaded file. Unspaced, a pass over 40 files fires 40
+    /// requests at once and every one returns 429 — 1,267 of them on
+    /// 2026-08-11 alone, which took the whole comments→Notion feature down
+    /// while looking like ordinary log noise.
+    private actor RateLimiter {
+        private var nextSlot = Date.distantPast
+        private let spacing: TimeInterval
+
+        init(spacing: TimeInterval) { self.spacing = spacing }
+
+        func reserve() async {
+            let now = Date()
+            let slot = max(now, nextSlot)
+            nextSlot = slot.addingTimeInterval(spacing)
+            let delay = slot.timeIntervalSince(now)
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+        }
+    }
+
+    private static let limiter = RateLimiter(spacing: 0.25)
+
+    /// Single choke point for every JSON call: paces requests, and honours a
+    /// 429 by backing off rather than hammering through the whole ledger.
+    private func send(_ req: URLRequest, path: String) async throws -> Data {
+        var attempt = 0
+        while true {
+            await Self.limiter.reserve()
+            let (data, response) = try await URLSession.shared.data(for: req)
+            guard let http = response as? HTTPURLResponse else {
+                throw FrameioError.unexpectedResponse(path)
+            }
+            if http.statusCode == 429 {
+                attempt += 1
+                guard attempt <= 4 else {
+                    Log("FrameioClient: still rate-limited after \(attempt) attempts for \(path) — abandoning this pass")
+                    throw FrameioError.rateLimited
+                }
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+                    .flatMap(Double.init) ?? pow(2.0, Double(attempt))
+                Log("FrameioClient: 429 for \(path) — backing off \(Int(retryAfter))s (attempt \(attempt))")
+                try? await Task.sleep(nanoseconds: UInt64(retryAfter * 1_000_000_000))
+                continue
+            }
+            guard (200..<300).contains(http.statusCode) else {
+                let body = String(data: data, encoding: .utf8) ?? ""
+                Log("FrameioClient: HTTP \(http.statusCode) for \(path): \(body.prefix(300))")
+                throw FrameioError.httpError(http.statusCode, body)
+            }
+            return data
+        }
+    }
 
     private func get(token: String, path: String) async throws -> Data {
         var req = URLRequest(url: URL(string: baseURL + path)!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue(clientID, forHTTPHeaderField: "x-api-key")
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try checkResponse(response, data: data, path: path)
-        return data
+        return try await send(req, path: path)
     }
 
     private func post(token: String, path: String, body: [String: Any]) async throws -> Data {
@@ -358,9 +414,7 @@ final class FrameioClient: @unchecked Sendable {
         req.setValue(clientID, forHTTPHeaderField: "x-api-key")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try checkResponse(response, data: data, path: path)
-        return data
+        return try await send(req, path: path)
     }
 
     private func patch(token: String, path: String, body: [String: Any]) async throws -> Data {
@@ -370,9 +424,7 @@ final class FrameioClient: @unchecked Sendable {
         req.setValue(clientID, forHTTPHeaderField: "x-api-key")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        let (data, response) = try await URLSession.shared.data(for: req)
-        try checkResponse(response, data: data, path: path)
-        return data
+        return try await send(req, path: path)
     }
 
     private func checkResponse(_ response: URLResponse, data: Data, path: String) throws {
@@ -412,6 +464,9 @@ enum FrameioError: LocalizedError {
     case unexpectedResponse(String)
     case uploadChunkFailed(Int)
     case transcodeError(String)
+    /// Distinct from `httpError(429, …)` so callers can abandon a whole pass
+    /// instead of retrying every remaining item into the same wall.
+    case rateLimited
 
     var errorDescription: String? {
         switch self {
@@ -419,6 +474,7 @@ enum FrameioError: LocalizedError {
         case .unexpectedResponse(let op):    return "Unexpected Frame.io response at \(op)"
         case .uploadChunkFailed(let i):      return "Upload chunk \(i) failed"
         case .transcodeError(let id):        return "Transcode error for file \(id)"
+        case .rateLimited:                   return "Frame.io rate limit reached"
         }
     }
 }

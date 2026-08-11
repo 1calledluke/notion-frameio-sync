@@ -16,7 +16,16 @@ final class AuthManager: NSObject {
 
     static let shared = AuthManager()
 
-    private let clientID    = Config.load().frameioClientID
+    /// Read at point of use, never cached.
+    ///
+    /// This was a stored `let`, captured once when the singleton was first
+    /// touched. If the client ID was blank in config at that moment, every auth
+    /// URL for the life of the process was built with `client_id=` — which
+    /// Adobe rejects instantly. That is exactly what happened between
+    /// 2026-07-17 and 2026-08-10: three "Connect to Frame.io" attempts could
+    /// not have worked, and pasting the ID into Settings didn't help because
+    /// only a relaunch would pick it up.
+    private var clientID: String { Config.load().frameioClientID }
     private let authURL     = "https://ims-na1.adobelogin.com/ims/authorize/v2"
     private let tokenURL    = "https://ims-na1.adobelogin.com/ims/token/v3"
     private let scope       = "openid,offline_access,email,profile,additional_info.roles"
@@ -54,6 +63,16 @@ final class AuthManager: NSObject {
     }
 
     func startOAuthFlow() {
+        // Fail loudly instead of opening a browser at an auth URL with
+        // `client_id=`, which Adobe rejects with no useful explanation and
+        // which looks, from the outside, like "logging in just doesn't work".
+        guard !clientID.isEmpty else {
+            Notifier.report(reason: "frameio-no-client-id",
+                            "Can't connect to Frame.io: no client ID is configured. Set frameioClientID in Settings first.")
+            onAuthFailed?("No Frame.io client ID configured")
+            return
+        }
+
         // Clear in-memory token but keep the keychain refresh token —
         // signOut() is only called when the user explicitly disconnects.
         accessToken = nil
@@ -142,6 +161,8 @@ final class AuthManager: NSObject {
 
     private func refresh() async throws -> String {
         guard let refreshToken = Keychain.load(key: keychainRefreshKey) else {
+            Notifier.report(reason: "frameio-auth",
+                            "Not signed in to Frame.io — uploads and comment sync are stopped. Connect in Settings.")
             throw AuthError.noRefreshToken
         }
         let body: [String: String] = [
@@ -152,12 +173,22 @@ final class AuthManager: NSObject {
         do {
             let tokens = try await postToken(body: body)
             store(tokens: tokens)
+            Notifier.clear(reason: "frameio-auth")
             return tokens.accessToken
         } catch {
             // Don't call signOut() here — a transient network error shouldn't
             // destroy a valid refresh token. The next validAccessToken() call
             // will retry. Only signOut() explicitly clears the token.
             Log("AuthManager: refresh failed — \(error)")
+            // Adobe says access_denied / invalid_grant when the refresh token is
+            // revoked or expired: no amount of retrying fixes it, a human has to
+            // log in again. Everything else (offline, 5xx) is transient and must
+            // stay quiet, or the alert becomes noise and gets ignored.
+            let detail = "\(error)"
+            if detail.contains("access_denied") || detail.contains("invalid_grant") {
+                Notifier.report(reason: "frameio-auth",
+                                "Frame.io login expired — uploads and comment sync are stopped. Reconnect in Settings → Connect to Frame.io.")
+            }
             throw AuthError.refreshFailed(error.localizedDescription)
         }
     }
