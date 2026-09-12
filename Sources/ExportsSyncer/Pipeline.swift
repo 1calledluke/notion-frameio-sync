@@ -1,8 +1,8 @@
 import Foundation
 
 /// Orchestrates the full upload pipeline for a single file:
-///   ffprobe check → Frame.io folder resolution → upload → version stack →
-///   transcode poll → share links → Notion comment
+///   ffprobe check → unchanged check → Frame.io folder resolution → upload →
+///   version stack → share links → Notion comment
 final class Pipeline: @unchecked Sendable {
 
     private let coordinator: Coordinator
@@ -48,7 +48,25 @@ final class Pipeline: @unchecked Sendable {
             }
         }
 
-        // 2. Resolve Frame.io account + root folder
+        // 2. Relative path = the deliverable's identity in the ledger
+        let exportsRoot = cfg.exportsRoot
+        let relPath = relativePath(filePath, under: exportsRoot)
+        let existing = ledger.deliverable(relPath: relPath)
+
+        // 3. Unchanged since the last upload? Then this "settle" is Dropbox
+        //    touching metadata, a re-save with identical bytes, or a second
+        //    settle of the same write — not a new version. This is what
+        //    turned one export into "v2" with a broken version stack.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: filePath)
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        if let ex = existing, ex.frameioFileID != nil,
+           ex.lastSize == size, ex.lastMtime == mtime {
+            Log("Pipeline: unchanged since last upload — skipping \(relPath)")
+            return
+        }
+
+        // 4. Resolve Frame.io account + root folder
         let token = try await AuthManager.shared.validAccessToken()
         frameio.setAccountID(cfg.frameioAccountID)
         let rootID: String
@@ -59,259 +77,245 @@ final class Pipeline: @unchecked Sendable {
         }
         frameio.setRootFolderID(rootID)
 
-        // 3. Determine relative path from exports root
-        let exportsRoot = cfg.exportsRoot
-        let relPath = relativePath(filePath, under: exportsRoot)
+        // 5. Work out where this file belongs: which Notion project (if any),
+        //    which client, and which subfolders under the project.
+        let projects = NotionAPI.allProjects(token: cfg.notionToken, databaseID: cfg.notionProjectsDB)
+        let placement = Self.resolvePlacement(relPath: relPath, projects: projects)
 
-        // 4. Resolve the target Notion project from the path
-        let folderContext = resolveFolderContext(relPath: relPath)
+        // Every export belongs to a Notion project — that's the rule of the
+        // tool. An unmatched file is held, not guessed into a folder: warn,
+        // and it goes through as soon as it's moved into a project folder.
+        guard let project = placement.project, let clientID = project.clientID else {
+            let folder = (relPath as NSString).deletingLastPathComponent
+            let why = placement.project == nil
+                ? "no Notion project matches the folder “\(folder)”"
+                : "the Notion project “\(placement.project!.name)” has no Client set"
+            Notifier.report(reason: "unmatched:\(relPath)",
+                            "NOT uploaded: \(baseName(relPath)) — \(why). Move it into a project folder with the job code in the name (or set the Client in Notion) and it will sync automatically.")
+            await MainActor.run {
+                self.coordinator.setNeedsAttention(reason: "Export not linked to a Notion project: \(self.baseName(relPath))")
+            }
+            return
+        }
 
-        // 5. Find or create Frame.io folder structure
-        let (clientFolderID, projectFolderID, notionProject, notionClientID) =
-            try await resolveFrameioFolders(token: token, cfg: cfg, context: folderContext, rootID: rootID)
+        // 6. Find or create the Frame.io folder tree
+        let tree = try await resolveFrameioFolders(token: token, placement: placement, rootID: rootID)
 
-        // 6. Upload
+        // 7. Upload. A re-export goes back into the folder its first version
+        //    lives in (so version stacking works) unless that folder is gone.
         let fileURL = URL(fileURLWithPath: filePath)
         let filename = fileURL.lastPathComponent
-        let deliverableKey = relPath // relative path is the canonical deliverable key
-        let existing = ledger.deliverable(relPath: deliverableKey)
-        let uploaded = try await frameio.uploadFile(token: token, fileURL: fileURL,
-                                                     folderID: projectFolderID)
-
-        // 7. Version stacking
+        var targetFolderID = existing?.frameioProjectFolderID ?? tree.uploadFolderID
         var record = existing ?? Ledger.DeliverableRecord(
-            versionCount: 0,
-            frameioFileID: nil,
-            frameioStackID: nil,
-            frameioProjectFolderID: projectFolderID
-        )
-        let newVersionCount = record.versionCount + 1
+            versionCount: 0, frameioFileID: nil, frameioStackID: nil,
+            frameioProjectFolderID: tree.uploadFolderID)
 
+        let uploaded: FrameioClient.UploadedFile
+        do {
+            uploaded = try await frameio.uploadFile(token: token, fileURL: fileURL, folderID: targetFolderID)
+        } catch FrameioError.httpError(404, _) where targetFolderID != tree.uploadFolderID {
+            Log("Pipeline: previous Frame.io folder is gone — uploading \(filename) fresh")
+            targetFolderID = tree.uploadFolderID
+            record.frameioFileID = nil
+            record.frameioStackID = nil
+            uploaded = try await frameio.uploadFile(token: token, fileURL: fileURL, folderID: targetFolderID)
+        }
+
+        // 8. Version stacking
+        let newVersionCount = record.versionCount + 1
         if let existingFileID = record.frameioFileID {
             do {
                 if let stackID = record.frameioStackID {
-                    // 3rd+ version: move onto existing stack
-                    try await frameio.addToVersionStack(token: token, stackID: stackID,
-                                                         newFileID: uploaded.id)
+                    try await frameio.addToVersionStack(token: token, stackID: stackID, newFileID: uploaded.id)
                 } else {
-                    // 2nd version: create stack
-                    let stackID = try await frameio.createVersionStack(
-                        token: token,
-                        folderID: projectFolderID,
-                        originalFileID: existingFileID,
-                        newFileID: uploaded.id
-                    )
-                    record.frameioStackID = stackID
+                    record.frameioStackID = try await frameio.createVersionStack(
+                        token: token, folderID: targetFolderID,
+                        originalFileID: existingFileID, newFileID: uploaded.id)
                 }
             } catch {
                 Log("Pipeline: version stack failed (non-fatal) — \(error)")
-                // Clear stale stack ID so next upload tries fresh
                 record.frameioStackID = nil
             }
         }
 
         record.versionCount = newVersionCount
         record.frameioFileID = uploaded.id
-        record.frameioProjectFolderID = projectFolderID
-        ledger.upsertDeliverable(relPath: deliverableKey, record: record)
+        record.frameioProjectFolderID = targetFolderID
+        record.lastSize = size
+        record.lastMtime = mtime
+        ledger.upsertDeliverable(relPath: relPath, record: record)
 
-        // 8. Share links (lazy: only on first upload for this project/client)
-        do {
-            try await ensureShareLinks(token: token, cfg: cfg,
-                                        clientFolderID: clientFolderID,
-                                        projectFolderID: projectFolderID,
-                                        notionProject: notionProject,
-                                        notionClientID: notionClientID,
-                                        folderContext: folderContext)
-        } catch {
-            Log("Pipeline: share link creation failed (non-fatal) — \(error)")
+        // 9. Share links + Notion comment
+        if let projectFolderID = tree.projectFolderID {
+            do {
+                try await ensureShareLinks(token: token, cfg: cfg,
+                                           clientFolderID: tree.clientFolderID,
+                                           projectFolderID: projectFolderID,
+                                           project: project, clientID: clientID,
+                                           clientFolderName: placement.clientFolderName)
+            } catch {
+                Log("Pipeline: share link creation failed (non-fatal) — \(error)")
+            }
         }
-
-        // 9. Notion comment
         let commentText = newVersionCount > 1
             ? "A new version of \(filename) uploaded"
             : "\(filename) uploaded"
-        if let pageID = notionProject?.id {
-            NotionAPI.postComment(token: cfg.notionToken, pageID: pageID, text: commentText)
-        }
+        NotionAPI.postComment(token: cfg.notionToken, pageID: project.id, text: commentText)
+        // A previously-held file that now matched: clear the menu-bar warning.
+        await MainActor.run { self.coordinator.clearAttention() }
 
         let summary = "\(filename) v\(newVersionCount) → Frame.io"
         Log("Pipeline: done — \(summary)")
         await MainActor.run { self.coordinator.notifyActivity(summary) }
     }
 
+    // MARK: - Placement: path → client / project / subfolders
+
+    struct Placement {
+        var parentFolderName: String?   // client nested under an agency ("Revel Advertising/Wilmington Beaches")
+        var clientFolderName: String
+        var project: NotionProject?     // nil when nothing in the path matched
+        var subfolders: [String]        // folders below the project (or below the client if unmatched)
+    }
+
+    /// The project folder is the FIRST path segment that matches a Notion
+    /// project — by job code first, then by name. Everything before it is the
+    /// client (and optionally the client's parent); everything after it is a
+    /// subfolder that gets mirrored in Frame.io. Nothing matched → the file
+    /// mirrors its folder path under the first segment as the client.
+    ///
+    /// Before this, a 4-deep path like client/project/Promos/Vertical/file was
+    /// read as parent/client/project and "Vertical" became a Notion project.
+    static func resolvePlacement(relPath: String, projects: [NotionProject]) -> Placement {
+        let segs = relPath.split(separator: "/").map(String.init).dropLast()   // folders only
+        let folders = Array(segs)
+
+        for (i, seg) in folders.enumerated() {
+            guard let project = matchProject(seg, in: projects) else { continue }
+            let before = Array(folders[..<i])
+            let client = before.last ?? seg
+            let parent = before.count >= 2 ? before[before.count - 2] : nil
+            return Placement(parentFolderName: parent, clientFolderName: client,
+                             project: project, subfolders: Array(folders[(i + 1)...]))
+        }
+        return Placement(parentFolderName: nil,
+                         clientFolderName: folders.first ?? "Untracked",
+                         project: nil,
+                         subfolders: Array(folders.dropFirst()))
+    }
+
+    /// Job code wins ("…_0095", "AMP-0012"); a name match needs the whole
+    /// compacted project name inside the folder name.
+    static func matchProject(_ folder: String, in projects: [NotionProject]) -> NotionProject? {
+        let compact = folder.filter { !$0.isWhitespace }.lowercased()
+        for p in projects where !p.jobCode.isEmpty {
+            let code = p.jobCode.lowercased()
+            if compact == code || compact.hasSuffix("_" + code) || compact.contains("_" + code + "_") {
+                return p
+            }
+        }
+        for p in projects {
+            let name = p.name.filter { !$0.isWhitespace }.lowercased()
+            guard name.count >= 3, compact.contains(name) else { continue }
+            return p
+        }
+        return nil
+    }
+
     // MARK: - Frame.io folder resolution
 
-    struct FolderContext {
-        var clientFolderName: String
-        var projectFolderName: String
-        var pathSegments: [String] // [parent?, client, project]
+    struct FolderTree {
+        let clientFolderID: String
+        let projectFolderID: String?
+        let uploadFolderID: String      // deepest folder — where the file goes
     }
 
-    private func resolveFolderContext(relPath: String) -> FolderContext {
-        let parts = relPath.split(separator: "/").map(String.init)
-        // relPath could be: client/project/file.mov
-        //                or parent/client/project/file.mov
-        // File is always last; folder segments are everything before
-        let folderParts = parts.dropLast() // remove filename
-
-        switch folderParts.count {
-        case 0, 1:
-            let name = folderParts.first ?? "Untracked"
-            return FolderContext(clientFolderName: name, projectFolderName: name,
-                                 pathSegments: [name])
-        case 2:
-            let segs = Array(folderParts)
-            return FolderContext(clientFolderName: segs[0], projectFolderName: segs[1],
-                                 pathSegments: segs)
-        default:
-            let segs = Array(folderParts)
-            // 3-level: parent/client/project or more
-            return FolderContext(clientFolderName: segs[segs.count - 2],
-                                 projectFolderName: segs[segs.count - 1],
-                                 pathSegments: segs)
-        }
-    }
-
-    private func resolveFrameioFolders(token: String, cfg: Config, context: FolderContext,
-                                        rootID: String) async throws
-        -> (clientFolderID: String, projectFolderID: String,
-            notionProject: NotionProject?, notionClientID: String?)
-    {
+    private func resolveFrameioFolders(token: String, placement: Placement,
+                                       rootID: String) async throws -> FolderTree {
         let ledger = coordinator.ledger
 
-        // Match to a Notion project: job code first, then sanitized name fallback
-        var notionProject: NotionProject? = nil
-        var notionClientID: String? = nil
-        let projects = NotionAPI.allProjects(token: cfg.notionToken,
-                                              databaseID: cfg.notionProjectsDB)
-        let folderName = context.projectFolderName
-        // Strip spaces from the folder name too, so "NCA Picnic" matches project "NCA Picnic"
-        let folderNameCompact = folderName
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }.joined()
-        for p in projects {
-            // Primary: job code match (works if job code is in folder name)
-            if !p.jobCode.isEmpty, folderName.contains(p.jobCode) {
-                notionProject = p; notionClientID = p.clientID; break
-            }
-            // Fallback: sanitized project name match (spaces stripped, case-insensitive)
-            let sanitized = p.name
-                .components(separatedBy: .whitespacesAndNewlines)
-                .filter { !$0.isEmpty }.joined()
-            if !sanitized.isEmpty, folderNameCompact.localizedCaseInsensitiveContains(sanitized) {
-                notionProject = p; notionClientID = p.clientID; break
-            }
-        }
-
-        // Build Frame.io folder tree
-        // For 3-level (parent/client/project), create parent first
         var parentID = rootID
-        let segs = context.pathSegments
-
-        if segs.count >= 3 {
-            // Create/find parent client folder
-            let parentFolder = try await frameio.findOrCreateFolder(
-                token: token, name: segs[0], parentID: rootID)
-            parentID = parentFolder.id
+        if let parent = placement.parentFolderName {
+            parentID = try await frameio.findOrCreateFolder(token: token, name: parent, parentID: rootID).id
         }
-
-        let clientName = context.clientFolderName
         let clientFolder = try await frameio.findOrCreateFolder(
-            token: token, name: clientName, parentID: parentID)
+            token: token, name: placement.clientFolderName, parentID: parentID)
 
-        let projectFolderDisplayName = notionProject?.name ?? context.projectFolderName
-        let projectFolder = try await frameio.findOrCreateFolder(
-            token: token, name: projectFolderDisplayName, parentID: clientFolder.id)
+        var projectFolderID: String? = nil
+        var cursor = clientFolder.id
+        if let project = placement.project {
+            let projectFolder = try await frameio.findOrCreateFolder(
+                token: token, name: project.name, parentID: clientFolder.id)
+            projectFolderID = projectFolder.id
+            cursor = projectFolder.id
 
-        // Cache in ledger
-        if let cid = notionClientID {
-            if ledger.frameioFolder(clientID: cid, projectID: nil) == nil {
-                ledger.upsertFrameioFolder(clientID: cid, projectID: nil,
-                                            folderID: clientFolder.id, shareLink: nil)
+            if let cid = project.clientID {
+                if ledger.frameioFolder(clientID: cid, projectID: nil) == nil {
+                    ledger.upsertFrameioFolder(clientID: cid, projectID: nil,
+                                               folderID: clientFolder.id, shareLink: nil)
+                }
+                if ledger.frameioFolder(clientID: cid, projectID: project.id) == nil {
+                    ledger.upsertFrameioFolder(clientID: cid, projectID: project.id,
+                                               folderID: projectFolder.id, shareLink: nil)
+                }
             }
-            if let pid = notionProject?.id,
-               ledger.frameioFolder(clientID: cid, projectID: pid) == nil {
-                ledger.upsertFrameioFolder(clientID: cid, projectID: pid,
-                                            folderID: projectFolder.id, shareLink: nil)
-            }
         }
 
-        // Untracked fallback: auto-create Notion page
-        if notionProject == nil {
-            handleUntrackedUpload(cfg: cfg, context: context, clientFolderID: clientFolder.id,
-                                   projectFolderID: projectFolder.id)
+        // Mirror any deeper local folders ("JBITS 2026 Promos/Vertical").
+        for sub in placement.subfolders {
+            cursor = try await frameio.findOrCreateFolder(token: token, name: sub, parentID: cursor).id
         }
 
-        return (clientFolder.id, projectFolder.id, notionProject, notionClientID)
-    }
-
-    private func handleUntrackedUpload(cfg: Config, context: FolderContext,
-                                        clientFolderID: String,
-                                        projectFolderID: String) {
-        Log("Pipeline: untracked upload — creating Notion page for '\(context.projectFolderName)'")
-
-        // Match client by folder name against existing Notion clients
-        // (exact match only — no fuzzy)
-        let matchedClientID: String? = nil // defer to Notion lookup if needed
-
-        if let pageID = NotionAPI.createProjectPage(
-            token: cfg.notionToken,
-            databaseID: cfg.notionProjectsDB,
-            name: context.projectFolderName,
-            clientID: matchedClientID,
-            reviewLink: nil
-        ) {
-            let msg = "Someone exported and uploaded files to Frame.io — \(Date()). Please review and assign this project."
-            NotionAPI.postComment(token: cfg.notionToken, pageID: pageID, text: msg)
-        }
+        return FolderTree(clientFolderID: clientFolder.id,
+                          projectFolderID: projectFolderID,
+                          uploadFolderID: cursor)
     }
 
     // MARK: - Share links
 
     private func ensureShareLinks(token: String, cfg: Config,
-                                   clientFolderID: String,
-                                   projectFolderID: String,
-                                   notionProject: NotionProject?,
-                                   notionClientID: String?,
-                                   folderContext: FolderContext) async throws {
+                                  clientFolderID: String, projectFolderID: String,
+                                  project: NotionProject, clientID: String,
+                                  clientFolderName: String) async throws {
         let ledger = coordinator.ledger
 
-        // Project-level share
-        if let project = notionProject, let clientID = notionClientID {
-            let projectRecord = ledger.frameioFolder(clientID: clientID, projectID: project.id)
-            let notionLinkMissing = project.reviewLink == nil || project.reviewLink?.isEmpty == true
-            if projectRecord?.shareLink == nil || projectRecord?.shareLink?.isEmpty == true || notionLinkMissing {
-                let shareName = "\(project.name) - Client Review"
-                let share = try await frameio.createShare(token: token,
-                                                          folderID: projectFolderID,
-                                                          name: shareName)
+        // Project-level share: once per project, or again if Notion lost it.
+        let projectRecord = ledger.frameioFolder(clientID: clientID, projectID: project.id)
+        let notionLinkMissing = project.reviewLink?.isEmpty ?? true
+        if (projectRecord?.shareLink?.isEmpty ?? true) || notionLinkMissing {
+            if let link = projectRecord?.shareLink, !link.isEmpty, notionLinkMissing {
+                // We have a link; Notion just doesn't. Reuse it, don't mint another.
+                NotionAPI.updateProjectReviewLink(token: cfg.notionToken, pageID: project.id, link: link)
+                Log("Pipeline: restored project review link in Notion → \(link)")
+            } else {
+                let share = try await frameio.createShare(token: token, folderID: projectFolderID,
+                                                          name: "\(project.name) - Client Review")
                 ledger.upsertFrameioFolder(clientID: clientID, projectID: project.id,
-                                            folderID: projectFolderID, shareLink: share.url)
-                NotionAPI.updateProjectReviewLink(token: cfg.notionToken,
-                                                   pageID: project.id,
-                                                   link: share.url)
+                                           folderID: projectFolderID, shareLink: share.url)
+                NotionAPI.updateProjectReviewLink(token: cfg.notionToken, pageID: project.id, link: share.url)
                 Log("Pipeline: created project share → \(share.url)")
             }
+        }
 
-            // Client-level share
-            let clientRecord = ledger.frameioFolder(clientID: clientID, projectID: nil)
-            if clientRecord?.shareLink == nil || clientRecord?.shareLink?.isEmpty == true {
-                let shareName = "\(folderContext.clientFolderName) — All Projects"
-                let share = try await frameio.createShare(token: token,
-                                                          folderID: clientFolderID,
-                                                          name: shareName)
-                ledger.upsertFrameioFolder(clientID: clientID, projectID: nil,
-                                            folderID: clientFolderID, shareLink: share.url)
-                NotionAPI.updateClientFrameioLink(token: cfg.notionToken,
-                                                   pageID: clientID,
-                                                   link: share.url)
-                Log("Pipeline: created client share → \(share.url)")
-            }
+        // Client-level share: once per client, ever. (The ledger lookup used
+        // to return an old link-less row, so every upload minted a new
+        // "All Projects" link and overwrote the one in Notion.)
+        let clientRecord = ledger.frameioFolder(clientID: clientID, projectID: nil)
+        if clientRecord?.shareLink?.isEmpty ?? true {
+            let share = try await frameio.createShare(token: token, folderID: clientFolderID,
+                                                      name: "\(clientFolderName) — All Projects")
+            ledger.upsertFrameioFolder(clientID: clientID, projectID: nil,
+                                       folderID: clientFolderID, shareLink: share.url)
+            NotionAPI.updateClientFrameioLink(token: cfg.notionToken, pageID: clientID, link: share.url)
+            Log("Pipeline: created client share → \(share.url)")
         }
     }
 
     // MARK: - Helpers
+
+    private func baseName(_ relPath: String) -> String {
+        (relPath as NSString).lastPathComponent
+    }
 
     private func relativePath(_ path: String, under root: String) -> String {
         var r = root

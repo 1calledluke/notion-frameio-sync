@@ -83,6 +83,34 @@ final class Ledger: @unchecked Sendable {
                 throw LedgerError.execFailed(String(cString: sqlite3_errmsg(db)))
             }
         }
+
+        // Additive columns — "duplicate column" on an already-migrated file
+        // is expected and ignored.
+        for sql in [
+            "ALTER TABLE deliverables ADD COLUMN last_size INTEGER",
+            "ALTER TABLE deliverables ADD COLUMN last_mtime REAL",
+            "ALTER TABLE deliverables ADD COLUMN comments_gone INTEGER NOT NULL DEFAULT 0",
+        ] {
+            sqlite3_exec(db, sql, nil, nil, nil)
+        }
+
+        // One-time cleanup: the client-level row (NULL project) was never
+        // replaced by INSERT OR REPLACE because NULL ≠ NULL in a primary key,
+        // so each client accumulated a dozen rows with a dozen share links.
+        // Keep only the newest linked row per client; the link-less seed row
+        // survives only where no linked row exists.
+        let dedupe = """
+            DELETE FROM frameio_folders
+            WHERE notion_project_id IS NULL
+              AND notion_client_id IN (
+                  SELECT notion_client_id FROM frameio_folders
+                  WHERE notion_project_id IS NULL AND share_link IS NOT NULL AND share_link != '')
+              AND rowid NOT IN (
+                  SELECT MAX(rowid) FROM frameio_folders
+                  WHERE notion_project_id IS NULL AND share_link IS NOT NULL AND share_link != ''
+                  GROUP BY notion_client_id)
+        """
+        sqlite3_exec(db, dedupe, nil, nil, nil)
     }
 
     // MARK: - Provisioned projects
@@ -154,6 +182,10 @@ final class Ledger: @unchecked Sendable {
         var frameioFileID: String?
         var frameioStackID: String?
         var frameioProjectFolderID: String?
+        /// Size + mtime of the bytes last uploaded, so a re-settle of the
+        /// same file is recognised and not uploaded as a new version.
+        var lastSize: Int64? = nil
+        var lastMtime: Double? = nil
     }
 
     func deliverable(relPath: String) -> DeliverableRecord? {
@@ -162,7 +194,7 @@ final class Ledger: @unchecked Sendable {
             defer { sqlite3_finalize(stmt) }
             let sql = """
                 SELECT version_count, frameio_file_id, frameio_stack_id,
-                       frameio_project_folder_id
+                       frameio_project_folder_id, last_size, last_mtime
                 FROM deliverables WHERE rel_path = ?
             """
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
@@ -172,7 +204,9 @@ final class Ledger: @unchecked Sendable {
                 versionCount: Int(sqlite3_column_int(stmt, 0)),
                 frameioFileID: colText(stmt, 1),
                 frameioStackID: colText(stmt, 2),
-                frameioProjectFolderID: colText(stmt, 3)
+                frameioProjectFolderID: colText(stmt, 3),
+                lastSize: sqlite3_column_type(stmt, 4) == SQLITE_NULL ? nil : sqlite3_column_int64(stmt, 4),
+                lastMtime: sqlite3_column_type(stmt, 5) == SQLITE_NULL ? nil : sqlite3_column_double(stmt, 5)
             )
         }
     }
@@ -182,8 +216,8 @@ final class Ledger: @unchecked Sendable {
             let sql = """
                 INSERT OR REPLACE INTO deliverables
                   (rel_path, version_count, frameio_file_id, frameio_stack_id,
-                   frameio_project_folder_id, last_uploaded_at)
-                VALUES (?, ?, ?, ?, ?, datetime('now'))
+                   frameio_project_folder_id, last_uploaded_at, last_size, last_mtime, comments_gone)
+                VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?, 0)
             """
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
@@ -193,19 +227,43 @@ final class Ledger: @unchecked Sendable {
             bindOptional(stmt, 3, record.frameioFileID)
             bindOptional(stmt, 4, record.frameioStackID)
             bindOptional(stmt, 5, record.frameioProjectFolderID)
+            if let s = record.lastSize { sqlite3_bind_int64(stmt, 6, s) } else { sqlite3_bind_null(stmt, 6) }
+            if let m = record.lastMtime { sqlite3_bind_double(stmt, 7, m) } else { sqlite3_bind_null(stmt, 7) }
+            sqlite3_step(stmt)
+        }
+    }
+
+    /// A file that Frame.io says no longer exists: stop asking it for
+    /// comments. Every deleted file was costing a 404 per pass forever.
+    func markFileGone(fileID: String) {
+        queue.sync {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "UPDATE deliverables SET comments_gone = 1 WHERE frameio_file_id = ?"
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, fileID, -1, SQLITE_TRANSIENT)
             sqlite3_step(stmt)
         }
     }
 
     // MARK: - Comment tracking (Frame.io comments -> Notion tasks)
 
-    /// Every uploaded file we could poll comments on, with the path so the
-    /// task title can carry a human filename.
+    /// Files worth polling for comments: uploaded in the last 30 days and not
+    /// known to be deleted. Clients comment on this month's cut, not on
+    /// headshots from the spring — and the whole ledger was 242 requests
+    /// per pass, which is what tripped Frame.io's rate limit all day
+    /// (60 days still left 211 files and ~50 429s per pass).
     func allUploadedFiles() -> [(relPath: String, fileID: String)] {
         queue.sync {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
-            let sql = "SELECT rel_path, frameio_file_id FROM deliverables WHERE frameio_file_id IS NOT NULL"
+            let sql = """
+                SELECT rel_path, frameio_file_id FROM deliverables
+                WHERE frameio_file_id IS NOT NULL
+                  AND COALESCE(comments_gone, 0) = 0
+                  AND last_uploaded_at > datetime('now', '-30 days')
+                ORDER BY last_uploaded_at DESC
+            """
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
             var out: [(String, String)] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -270,10 +328,14 @@ final class Ledger: @unchecked Sendable {
         queue.sync {
             var stmt: OpaquePointer?
             defer { sqlite3_finalize(stmt) }
+            // Prefer a row that actually has a share link, newest first — an
+            // old link-less seed row must never shadow the real one.
             let sql = """
                 SELECT frameio_folder_id, share_link
                 FROM frameio_folders
                 WHERE notion_client_id = ? AND (notion_project_id = ? OR (notion_project_id IS NULL AND ? IS NULL))
+                ORDER BY (share_link IS NULL OR share_link = '') ASC, rowid DESC
+                LIMIT 1
             """
             guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
             sqlite3_bind_text(stmt, 1, clientID, -1, SQLITE_TRANSIENT)
@@ -293,6 +355,17 @@ final class Ledger: @unchecked Sendable {
     func upsertFrameioFolder(clientID: String, projectID: String?,
                               folderID: String, shareLink: String?) {
         queue.sync {
+            // NULL never equals NULL, so INSERT OR REPLACE can't replace the
+            // client-level row — clear it by hand first.
+            if projectID == nil {
+                var del: OpaquePointer?
+                defer { sqlite3_finalize(del) }
+                let delSQL = "DELETE FROM frameio_folders WHERE notion_client_id = ? AND notion_project_id IS NULL"
+                if sqlite3_prepare_v2(db, delSQL, -1, &del, nil) == SQLITE_OK {
+                    sqlite3_bind_text(del, 1, clientID, -1, SQLITE_TRANSIENT)
+                    sqlite3_step(del)
+                }
+            }
             let sql = """
                 INSERT OR REPLACE INTO frameio_folders
                   (notion_client_id, notion_project_id, frameio_folder_id, share_link)

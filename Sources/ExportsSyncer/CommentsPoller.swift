@@ -17,11 +17,14 @@ final class CommentsPoller {
     }
 
     func start() {
-        let interval = Config.load().commentsPollSeconds
-        guard interval > 0 else {
+        let configured = Config.load().commentsPollSeconds
+        guard configured > 0 else {
             Log("CommentsPoller disabled (commentsPollSeconds = 0)")
             return
         }
+        // Floor of 15 minutes: a client comment can wait that long, and
+        // anything faster shares the rate limit with uploads.
+        let interval = max(configured, 900)
         Log("CommentsPoller started (every \(Int(interval))s)")
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             self?.tick()
@@ -67,8 +70,12 @@ final class CommentsPoller {
                 Notifier.report(reason: "frameio-rate-limit",
                                 "Frame.io rate limit reached — client comments aren't syncing to Notion. It'll retry automatically; tell me if it keeps happening.")
                 return
+            } catch FrameioError.httpError(404, _) {
+                // Deleted on Frame.io. Retire it so it never costs a request again.
+                ledger.markFileGone(fileID: fileID)
+                Log("CommentsPoller: \((relPath as NSString).lastPathComponent) is gone from Frame.io — retired from comment polling")
+                continue
             } catch {
-                // 404s happen when a file was deleted on Frame.io — not fatal.
                 continue
             }
 

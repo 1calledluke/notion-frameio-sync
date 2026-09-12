@@ -109,9 +109,12 @@ final class ExportsWatcher: @unchecked Sendable {
     private func handleEvent(path: String) {
         guard shouldProcess(path: path) else { return }
 
-        // Start debounce timer on first event; ignore subsequent events while timer is pending
+        // Quiet timer: every write pushes the deadline out, so a file only
+        // "settles" after 30s with no activity. The old fixed window fired
+        // mid-render, then fired again on the next write — one export became
+        // two uploads and a bogus v2.
         DispatchQueue.main.async {
-            guard self.pendingTimers[path] == nil else { return }
+            self.pendingTimers[path]?.invalidate()
             self.pendingTimers[path] = Timer.scheduledTimer(
                 withTimeInterval: self.debounceSeconds,
                 repeats: false

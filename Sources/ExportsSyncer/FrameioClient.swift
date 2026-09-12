@@ -367,7 +367,9 @@ final class FrameioClient: @unchecked Sendable {
         }
     }
 
-    private static let limiter = RateLimiter(spacing: 0.25)
+    // 0.25s still drew a 429 roughly every fourth call on a long comments
+    // pass; Frame.io's Retry-After is 2s, so 0.6s keeps a pass clean.
+    private static let limiter = RateLimiter(spacing: 0.6)
 
     /// Single choke point for every JSON call: paces requests, and honours a
     /// 429 by backing off rather than hammering through the whole ledger.
